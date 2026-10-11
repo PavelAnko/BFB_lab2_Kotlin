@@ -4,6 +4,8 @@ import java.util.concurrent.atomic.AtomicReference
 
 object PairwiseSum {
 
+    private const val BATCH_SIZE = 1 shl 18
+
     fun compute(data: IntArray): Int {
         if (data.size <= 1) return if (data.isEmpty()) 0 else data[0]
         return reduce(data)
@@ -15,23 +17,26 @@ object PairwiseSum {
         val stopped = CountDownLatch(workerCount)
         val finished = CountDownLatch(1)
         val error = AtomicReference<Throwable>()
+        val freeWorkers = ArrayBlockingQueue<Int>(workerCount)
         val inboxes = Array(workerCount) { ArrayBlockingQueue<Command>(1) }
 
         val threads = Array(workerCount) { id ->
-            Thread(Worker(data, inboxes[id], ready, stopped, error), "worker-$id")
+            Thread(Worker(id, data, inboxes[id], freeWorkers, ready, stopped, error), "worker-$id")
         }
         threads.forEach { it.start() }
         ready.await()
 
-        Thread(Controller(data, inboxes, stopped, finished, error), "controller").start()
+        Thread(Controller(data, inboxes, freeWorkers, stopped, finished, error), "controller").start()
         finished.await()
         error.get()?.let { throw it }
         return data[0]
     }
 
     private class Worker(
+        private val id: Int,
         private val data: IntArray,
         private val inbox: ArrayBlockingQueue<Command>,
+        private val freeWorkers: ArrayBlockingQueue<Int>,
         private val ready: CountDownLatch,
         private val stopped: CountDownLatch,
         private val error: AtomicReference<Throwable>,
@@ -40,6 +45,7 @@ object PairwiseSum {
         override fun run() {
             ready.countDown()
             try {
+                freeWorkers.put(id)
                 while (true) {
                     when (val command = inbox.take()) {
                         StopCommand -> return
@@ -62,6 +68,7 @@ object PairwiseSum {
                 error.compareAndSet(null, thrown)
             } finally {
                 command.done.countDown()
+                freeWorkers.put(id)
             }
         }
     }
@@ -69,6 +76,7 @@ object PairwiseSum {
     private class Controller(
         private val data: IntArray,
         private val inboxes: Array<ArrayBlockingQueue<Command>>,
+        private val freeWorkers: ArrayBlockingQueue<Int>,
         private val stopped: CountDownLatch,
         private val finished: CountDownLatch,
         private val error: AtomicReference<Throwable>,
@@ -95,16 +103,14 @@ object PairwiseSum {
 
         private fun runWave(length: Int) {
             val pairs = length / 2
-            val workerCount = inboxes.size
-            val slices = ArrayList<Slice>(workerCount)
-            for (id in 0 until workerCount) {
-                val from = (id.toLong() * pairs / workerCount).toInt()
-                val end = ((id + 1L) * pairs / workerCount).toInt()
-                if (from < end) slices.add(Slice(id, from, end))
-            }
-            val done = CountDownLatch(slices.size)
-            for (slice in slices) {
-                inboxes[slice.workerId].put(RangeCommand(slice.from, slice.end, length, done))
+            val batches = (pairs + BATCH_SIZE - 1) / BATCH_SIZE
+            val done = CountDownLatch(batches)
+            var next = 0
+            repeat(batches) {
+                val id = freeWorkers.take()
+                val end = minOf(next + BATCH_SIZE, pairs)
+                inboxes[id].put(RangeCommand(next, end, length, done))
+                next = end
             }
             done.await()
         }
@@ -115,8 +121,6 @@ object PairwiseSum {
             }
             stopped.await()
         }
-
-        private class Slice(val workerId: Int, val from: Int, val end: Int)
     }
 
     private sealed interface Command
